@@ -1,0 +1,42 @@
+# Netlify Configuration for Career AI Platform
+
+[build]
+# Build directory
+base = "frontend"
+# Build command for Next.js
+command = "npm run build"
+# Publish directory (Next.js output)
+publish = ".next"
+
+[build.environment]
+# Node version
+NODE_VERSION = "20"
+# Next.js production build
+NODE_ENV = "production"
+
+# Environment variables (set these in Netlify dashboard)
+[context.production.environment]
+NEXT_PUBLIC_API_URL = "https://career-ai-platform-api.onrender.com"
+NEXT_PUBLIC_APP_URL = "https://career-ai-platform.netlify.app"
+
+# Redirect API calls to Render backend
+[[redirects]]
+from = "/api/*"
+to = "https://career-ai-platform-api.onrender.com/api/:splat"
+status = 200
+force = false
+
+# Redirect undefined routes to index for client-side routing
+[[redirects]]
+from = "/*"
+to = "/index.html"
+status = 200
+
+# Security headers
+[[headers]]
+for = "/*"
+[headers.values]
+X-Frame-Options = "SAMEORIGIN"
+X-Content-Type-Options = "nosniff"
+X-XSS-Protection = "1; mode=block"
+Referrer-Policy = "strict-origin-when-cross-origin"
