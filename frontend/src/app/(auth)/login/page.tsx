@@ -2,12 +2,10 @@
 
 import { useState } from 'react'
 import Link from 'next/link'
-import { useRouter } from 'next/navigation'
 
 import { useAuth } from '@/lib/hooks/useAuth'
 
 export default function LoginPage() {
-  const router = useRouter()
   const { login, isLoading, error } = useAuth()
   const [formData, setFormData] = useState({
     email: '',

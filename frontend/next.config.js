@@ -2,11 +2,6 @@
 const nextConfig = {
   reactStrictMode: true,
   swcMinify: true,
-  
-  // Enable experimental features if needed
-  experimental: {
-    appDir: true,
-  },
 
   // Environment variables
   env: {
@@ -67,4 +62,3 @@ const nextConfig = {
 };
 
 module.exports = nextConfig;
-
