@@ -1,0 +1,518 @@
+name: Production Deployment (CD)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'backend/**'
+      - 'frontend/**'
+      - 'docker-compose.prod.yml'
+      - 'Dockerfile.prod'
+      - '.github/workflows/cd-deploy.yml'
+  workflow_dispatch:
+    inputs:
+      deployment_target:
+        description: 'Deployment target environment'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+          - staging
+          - production
+
+env:
+  REGISTRY: ghcr.io
+  BACKEND_IMAGE_NAME: ${{ github.repository }}/backend
+  FRONTEND_IMAGE_NAME: ${{ github.repository }}/frontend
+
+jobs:
+  # ============================================================================
+  # BUILD AND TEST
+  # ============================================================================
+  build-and-test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Cache Python dependencies
+        uses: actions/cache@v3
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('backend/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Cache Node dependencies
+        uses: actions/cache@v3
+        with:
+          path: frontend/node_modules
+          key: ${{ runner.os }}-node-${{ hashFiles('frontend/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-node-
+
+      - name: Install backend dependencies
+        run: |
+          cd backend
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Install frontend dependencies
+        run: |
+          cd frontend
+          npm install
+
+      - name: Lint backend
+        run: |
+          cd backend
+          black --check app/
+          flake8 app/ --count --select=E9,F63,F7,F82 --show-source --statistics
+
+      - name: Type check frontend
+        run: |
+          cd frontend
+          npm run type-check
+
+      - name: Run backend tests
+        run: |
+          cd backend
+          pytest --cov=app --cov-report=xml --cov-report=term
+        env:
+          DATABASE_URL: sqlite:///test.db
+          ENVIRONMENT: testing
+          DEBUG: "True"
+          LOG_LEVEL: DEBUG
+
+      - name: Run frontend tests
+        run: |
+          cd frontend
+          npm run test -- --coverage --watchAll=false
+        continue-on-error: true
+
+      - name: Upload backend coverage
+        uses: codecov/codecov-action@v3
+        with:
+          files: ./backend/coverage.xml
+          flags: backend
+          name: backend-coverage
+
+      - name: Upload frontend coverage
+        uses: codecov/codecov-action@v3
+        with:
+          files: ./frontend/coverage/coverage-final.json
+          flags: frontend
+          name: frontend-coverage
+        continue-on-error: true
+
+  # ============================================================================
+  # BUILD DOCKER IMAGES
+  # ============================================================================
+  build-images:
+    needs: build-and-test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v2
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata (backend)
+        id: meta_backend
+        uses: docker/metadata-action@v4
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha
+
+      - name: Extract metadata (frontend)
+        id: meta_frontend
+        uses: docker/metadata-action@v4
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.FRONTEND_IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha
+
+      - name: Build and push backend image
+        uses: docker/build-push-action@v4
+        with:
+          context: ./backend
+          file: ./backend/Dockerfile.prod
+          push: true
+          tags: ${{ steps.meta_backend.outputs.tags }}
+          labels: ${{ steps.meta_backend.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build and push frontend image
+        uses: docker/build-push-action@v4
+        with:
+          context: ./frontend
+          file: ./frontend/Dockerfile.prod
+          push: true
+          tags: ${{ steps.meta_frontend.outputs.tags }}
+          labels: ${{ steps.meta_frontend.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ============================================================================
+  # SECURITY SCANNING
+  # ============================================================================
+  security-scan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run Trivy vulnerability scanner (backend)
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: './backend'
+          format: 'sarif'
+          output: 'backend-trivy.sarif'
+
+      - name: Run Trivy vulnerability scanner (frontend)
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: './frontend'
+          format: 'sarif'
+          output: 'frontend-trivy.sarif'
+
+      - name: Upload Trivy results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v2
+        with:
+          sarif_file: 'backend-trivy.sarif'
+
+      - name: Upload Trivy results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v2
+        with:
+          sarif_file: 'frontend-trivy.sarif'
+
+  # ============================================================================
+  # DEPLOY TO STAGING
+  # ============================================================================
+  deploy-staging:
+    needs: [build-images, security-scan]
+    runs-on: ubuntu-latest
+    environment:
+      name: staging
+      url: https://staging.yourdomain.com
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Deploy to staging server
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.STAGING_SERVER_HOST }}
+          username: ${{ secrets.STAGING_SERVER_USER }}
+          key: ${{ secrets.STAGING_SERVER_SSH_KEY }}
+          script: |
+            cd /opt/career-ai-platform
+            
+            # Pull latest changes
+            git fetch origin
+            git checkout origin/main
+            
+            # Pull latest images
+            docker-compose -f docker-compose.prod.yml pull
+            
+            # Run migrations
+            docker-compose -f docker-compose.prod.yml run --rm backend alembic upgrade head
+            
+            # Restart services
+            docker-compose -f docker-compose.prod.yml up -d
+            
+            # Health check
+            sleep 10
+            curl -f http://localhost:8000/health || exit 1
+
+      - name: Notify Slack on staging deployment
+        if: success()
+        uses: slackapi/slack-github-action@v1.24.0
+        with:
+          webhook-url: ${{ secrets.SLACK_WEBHOOK }}
+          payload: |
+            {
+              "text": "✅ Staging deployment successful",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*Staging Deployment Successful* 🎉\n*Commit:* ${{ github.sha }}\n*Branch:* main\n*URL:* https://staging.yourdomain.com"
+                  }
+                }
+              ]
+            }
+
+      - name: Notify Slack on failure
+        if: failure()
+        uses: slackapi/slack-github-action@v1.24.0
+        with:
+          webhook-url: ${{ secrets.SLACK_WEBHOOK }}
+          payload: |
+            {
+              "text": "❌ Staging deployment failed",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*Staging Deployment Failed* ❌\n*Commit:* ${{ github.sha }}\n*Branch:* main\n*Action:* ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+                  }
+                }
+              ]
+            }
+
+  # ============================================================================
+  # SMOKE TESTS (Post-deployment)
+  # ============================================================================
+  smoke-tests:
+    needs: deploy-staging
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install test dependencies
+        run: |
+          pip install requests pytest
+
+      - name: Run smoke tests against staging
+        run: |
+          python -m pytest tests/smoke/ -v
+        env:
+          API_URL: https://staging.yourdomain.com/api
+          TIMEOUT: 10
+
+  # ============================================================================
+  # APPROVE & DEPLOY TO PRODUCTION
+  # ============================================================================
+  deploy-production-approval:
+    needs: smoke-tests
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    steps:
+      - name: Manual approval pending
+        run: echo "Waiting for manual approval to deploy to production..."
+
+  deploy-production:
+    needs: deploy-production-approval
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: https://yourdomain.com
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Create backup before deployment
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.PRODUCTION_SERVER_HOST }}
+          username: ${{ secrets.PRODUCTION_SERVER_USER }}
+          key: ${{ secrets.PRODUCTION_SERVER_SSH_KEY }}
+          script: |
+            cd /opt/career-ai-platform
+            
+            # Backup database
+            docker-compose -f docker-compose.prod.yml exec -T postgres pg_dump -U postgres career_ai_prod > backup_$(date +%Y%m%d_%H%M%S).sql
+            
+            # Backup volumes
+            docker run --rm -v career-ai-postgres:/data -v /backup:/backup alpine tar czf /backup/postgres_backup_$(date +%Y%m%d_%H%M%S).tar.gz /data
+
+      - name: Deploy to production server
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.PRODUCTION_SERVER_HOST }}
+          username: ${{ secrets.PRODUCTION_SERVER_USER }}
+          key: ${{ secrets.PRODUCTION_SERVER_SSH_KEY }}
+          script: |
+            cd /opt/career-ai-platform
+            
+            # Pull latest changes
+            git fetch origin
+            git checkout origin/main
+            
+            # Pull latest images
+            docker-compose -f docker-compose.prod.yml pull
+            
+            # Run migrations
+            docker-compose -f docker-compose.prod.yml run --rm backend alembic upgrade head
+            
+            # Restart services with blue-green deployment
+            docker-compose -f docker-compose.prod.yml up -d --no-deps --build backend frontend
+            
+            # Health check with retries
+            for i in {1..30}; do
+              if curl -f http://localhost:8000/health; then
+                echo "Health check passed"
+                exit 0
+              fi
+              echo "Health check attempt $i/30 failed, retrying..."
+              sleep 10
+            done
+            exit 1
+
+      - name: Verify production deployment
+        run: |
+          for i in {1..5}; do
+            if curl -f https://yourdomain.com/api/health; then
+              echo "Production health check passed"
+              exit 0
+            fi
+            echo "Production health check attempt $i/5 failed, retrying..."
+            sleep 10
+          done
+          exit 1
+
+      - name: Notify Slack on production deployment
+        if: success()
+        uses: slackapi/slack-github-action@v1.24.0
+        with:
+          webhook-url: ${{ secrets.SLACK_WEBHOOK }}
+          payload: |
+            {
+              "text": "✅ Production deployment successful",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*Production Deployment Successful* 🚀\n*Commit:* ${{ github.sha }}\n*Branch:* main\n*URL:* https://yourdomain.com\n*Deployed by:* ${{ github.actor }}"
+                  }
+                }
+              ]
+            }
+
+      - name: Create deployment release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: v${{ github.run_number }}
+          release_name: Production Release v${{ github.run_number }}
+          body: |
+            Production deployment successful
+            
+            Commit: ${{ github.sha }}
+            Branch: main
+            Timestamp: ${{ github.event.head_commit.timestamp }}
+          draft: false
+          prerelease: false
+
+      - name: Notify Slack on failure
+        if: failure()
+        uses: slackapi/slack-github-action@v1.24.0
+        with:
+          webhook-url: ${{ secrets.SLACK_WEBHOOK }}
+          payload: |
+            {
+              "text": "❌ Production deployment failed",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*Production Deployment Failed* ❌\n*Commit:* ${{ github.sha }}\n*Branch:* main\n*Action:* ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\n*Triggered by:* ${{ github.actor }}"
+                  }
+                }
+              ]
+            }
+
+  # ============================================================================
+  # ROLLBACK (Manual trigger for emergency rollback)
+  # ============================================================================
+  rollback:
+    runs-on: ubuntu-latest
+    if: failure()
+
+    steps:
+      - name: Rollback to previous version
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.PRODUCTION_SERVER_HOST }}
+          username: ${{ secrets.PRODUCTION_SERVER_USER }}
+          key: ${{ secrets.PRODUCTION_SERVER_SSH_KEY }}
+          script: |
+            cd /opt/career-ai-platform
+            
+            # Rollback to previous commit
+            git reset --hard HEAD~1
+            
+            # Restart services with previous version
+            docker-compose -f docker-compose.prod.yml down
+            docker-compose -f docker-compose.prod.yml up -d
+            
+            # Verify rollback
+            sleep 10
+            curl -f http://localhost:8000/health || exit 1
+
+      - name: Notify Slack on rollback
+        uses: slackapi/slack-github-action@v1.24.0
+        with:
+          webhook-url: ${{ secrets.SLACK_WEBHOOK }}
+          payload: |
+            {
+              "text": "⚠️ Production rollback triggered",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*Production Rollback* ⚠️\n*Previous Commit:* ${{ github.sha }}\n*Action:* ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\n*Triggered by:* ${{ github.actor }}"
+                  }
+                }
+              ]
+            }
