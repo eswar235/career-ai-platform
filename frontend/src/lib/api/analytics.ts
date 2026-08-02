@@ -12,7 +12,6 @@ import type {
   SourceBreakdownResponse,
   DetailedBreakdownResponse,
   InsightsResponse,
-  ExportResponse,
 } from "@/lib/types/analytics";
 
 const BASE_PATH = "/api/analytics";
