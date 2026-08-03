@@ -43,7 +43,7 @@ pdfplumber==0.10.3
 python-docx==0.8.11
 
 # NLP & Text Processing
-spacy==3.7.2
+# spacy==3.7.2  # Removed - causes build errors on Render (Cython compilation issues)
 nltk==3.8.1
 
 # Data Processing
